@@ -1,6 +1,7 @@
 import argparse
 import random
 import math
+import copy
 
 from tqdm import tqdm
 import numpy as np
@@ -16,10 +17,18 @@ from torchvision import datasets, transforms, utils
 from dataset import MultiResolutionDataset
 from model import StyledGenerator, Discriminator
 
+import os
+os.environ['CUDA_VISIBLE_DEVICES'] = '0,1'
+
+
+def init_freeze(model):
+    for p in model.parameters():
+        p.frozen = False
 
 def requires_grad(model, flag=True):
     for p in model.parameters():
-        p.requires_grad = flag
+        if not p.frozen:
+            p.requires_grad = flag
 
 
 def accumulate(model1, model2, decay=0.999):
@@ -43,6 +52,17 @@ def adjust_lr(optimizer, lr):
         group['lr'] = lr * mult
 
 
+# def mse(input, target):
+#     return torch.mean((input - target) ** 2)
+#
+#
+# def get_weight_distance(w_full, w_freeze):
+#     distances= []
+#     for k in w_freeze:
+#         distances.append(mse(w_full[k], w_freeze[k]))
+
+    return torch.tensor(distances).mean()
+
 def train(args, dataset, generator, discriminator):
     step = int(math.log2(args.init_size)) - 2
     resolution = 4 * 2 ** step
@@ -63,9 +83,12 @@ def train(args, dataset, generator, discriminator):
     gen_loss_val = 0
     grad_loss_val = 0
 
+    # gen_freeze_dict = {}
+    # disc_freeze_dict = {}
+
     alpha = 0
     used_sample = 0
-    
+
     max_step = int(math.log2(args.max_size)) - 2
     final_progress = False
 
@@ -77,7 +100,56 @@ def train(args, dataset, generator, discriminator):
         if resolution == args.init_size or final_progress:
             alpha = 1
 
-        if used_sample > args.phase * 2:
+        check = args.phase * 2
+
+        if used_sample > check:
+            if step > 2:
+                # # Weight matching!
+                # for n in range(step + 1):
+                #     gen_key = 'match.' + str(n)
+                #     for k in generator.module.state_dict():
+                #         if gen_key in k:
+                #             gen_freeze_dict[k] = copy.deepcopy(generator.module.state_dict()[k])
+                #             gen_freeze_dict[k].requires_grad=False
+                #
+                # for n in range(step + 2):
+                #     disc_key = 'match.' + str(8 - n)
+                #     for k in discriminator.module.state_dict():
+                #         if disc_key in k:
+                #             disc_freeze_dict[k] = copy.deepcopy(discriminator.module.state_dict()[k])
+                #             disc_freeze_dict[k].requires_grad=False
+                #
+                # if step == 3:
+                #     for k in generator.module.state_dict():
+                #         if k.startswith('style'):
+                #             gen_freeze_dict[k] = copy.deepcopy(generator.module.state_dict()[k])
+                #             gen_freeze_dict[k].requires_grad=False
+
+                # Weight matching!
+                for n in range(step + 1):
+                    gen_key = 'match.' + str(n)
+                    for name, k in generator.named_parameters():
+                        if gen_key in name:
+                            k.requires_grad = False
+                            k.frozen = True
+
+                for n in range(step + 2):
+                    disc_key = 'match.' + str(8 - n)
+                    for name, k in discriminator.named_parameters():
+                        if disc_key in name:
+                            k.requires_grad = False
+                            k.frozen = True
+
+                if step == 3:
+                    print('Freezing Style network now!')
+                    for name, k in generator.named_parameters():
+                        if name.startswith('module.style'):
+                            k.requires_grad = False
+                            k.frozen = True
+
+            adjust_lr(g_optimizer, args.lr.get(resolution, 0.001))
+            adjust_lr(d_optimizer, args.lr.get(resolution, 0.001))
+
             used_sample = 0
             step += 1
 
@@ -103,7 +175,7 @@ def train(args, dataset, generator, discriminator):
                     'd_optimizer': d_optimizer.state_dict(),
                     'g_running': g_running.state_dict()
                 },
-                f'checkpoint/train_step-{step}.model',
+                f'/scratch/bunk/results/torchgan/checkpoint/train_step-{step}.model',
             )
 
             adjust_lr(g_optimizer, args.lr.get(resolution, 0.001))
@@ -136,7 +208,7 @@ def train(args, dataset, generator, discriminator):
                 outputs=real_predict.sum(), inputs=real_image, create_graph=True
             )[0]
             grad_penalty = (
-                grad_real.view(grad_real.size(0), -1).norm(2, dim=1) ** 2
+                    grad_real.view(grad_real.size(0), -1).norm(2, dim=1) ** 2
             ).mean()
             grad_penalty = 10 / 2 * grad_penalty
             grad_penalty.backward()
@@ -171,7 +243,7 @@ def train(args, dataset, generator, discriminator):
                 outputs=hat_predict.sum(), inputs=x_hat, create_graph=True
             )[0]
             grad_penalty = (
-                (grad_x_hat.view(grad_x_hat.size(0), -1).norm(2, dim=1) - 1) ** 2
+                    (grad_x_hat.view(grad_x_hat.size(0), -1).norm(2, dim=1) - 1) ** 2
             ).mean()
             grad_penalty = 10 * grad_penalty
             grad_penalty.backward()
@@ -182,6 +254,20 @@ def train(args, dataset, generator, discriminator):
             fake_predict = F.softplus(fake_predict).mean()
             fake_predict.backward()
             disc_loss_val = (real_predict + fake_predict).item()
+
+        # if step > 1:
+        #     disc_loss = nn.MSELoss()
+        #     disc_losses = []
+        #     for k in disc_freeze_dict:
+        #         tmp = disc_loss(discriminator.module.state_dict()[k], disc_freeze_dict[k])
+        #         if not torch.isnan(tmp):
+        #             disc_losses.append(tmp)
+        #
+        #     # change
+        #     disc_freeze_loss = Variable(torch.tensor(disc_losses).mean(), requires_grad=False)
+        #
+        #     #disc_freeze_loss.backward()
+        #     disc_loss_freeze_val = disc_freeze_loss.item()
 
         d_optimizer.step()
 
@@ -201,9 +287,24 @@ def train(args, dataset, generator, discriminator):
             elif args.loss == 'r1':
                 loss = F.softplus(-predict).mean()
 
+            loss.backward()
             gen_loss_val = loss.item()
 
-            loss.backward()
+            # if step > 1:
+            #     gen_loss = nn.MSELoss()
+            #     gen_losses = []
+            #
+            #     for k in gen_freeze_dict:
+            #         tmp = gen_loss(generator.module.state_dict()[k], gen_freeze_dict[k]) * 10000
+            #         if not torch.isnan(tmp):
+            #             gen_losses.append(tmp)
+            #
+            #     # CHANGE DEBUG
+            #     gen_freeze_loss = Variable(torch.tensor(gen_losses).mean(), requires_grad=False)
+            #
+            #     #gen_freeze_loss.backward()
+            #     gen_loss_freeze_val = gen_freeze_loss.item()
+
             g_optimizer.step()
             accumulate(g_running, generator.module)
 
@@ -223,19 +324,35 @@ def train(args, dataset, generator, discriminator):
                         ).data.cpu()
                     )
 
-            utils.save_image(
-                torch.cat(images, 0),
-                f'sample/{str(i + 1).zfill(6)}.png',
-                nrow=gen_i,
-                normalize=True,
-                range=(-1, 1),
-            )
+            if step < 4:
+                utils.save_image(
+                    torch.cat(images, 0),
+                    f'/scratch/bunk/results/torchgan/sample/{str(i + 1).zfill(6)}.png',
+                    nrow=gen_i,
+                    normalize=True,
+                    range=(-1, 1),
+                )
+            else:
+                utils.save_image(
+                    torch.cat(images, 0),
+                    f'/scratch/bunk/results/torchgan/sample/{str(i + 1).zfill(6)}-' + str(gen_loss_freeze_val) + '-' + str(disc_loss_freeze_val) + '.png',
+                    nrow=gen_i,
+                    normalize=True,
+                    range=(-1, 1),
+                    )
+
 
         if (i + 1) % 10000 == 0:
             torch.save(
-                g_running.state_dict(), f'checkpoint/{str(i + 1).zfill(6)}.model'
+                g_running.state_dict(), f'/scratch/bunk/results/torchgan/checkpoint/{str(i + 1).zfill(6)}.model'
             )
 
+        # if step > 1:
+        #     state_msg = (
+        #         f'Size: {4 * 2 ** step}; G: {gen_loss_val:.3f}; GF:{gen_loss_freeze_val:.3f}; D: {disc_loss_val:.3f}; DF:{disc_loss_freeze_val:.3f}; '
+        #         f' Grad: {grad_loss_val:.3f}; Alpha: {alpha:.5f}'
+        #     )
+        # else:
         state_msg = (
             f'Size: {4 * 2 ** step}; G: {gen_loss_val:.3f}; D: {disc_loss_val:.3f};'
             f' Grad: {grad_loss_val:.3f}; Alpha: {alpha:.5f}'
@@ -261,7 +378,7 @@ if __name__ == '__main__':
     parser.add_argument('--lr', default=0.001, type=float, help='learning rate')
     parser.add_argument('--sched', action='store_true', help='use lr scheduling')
     parser.add_argument('--init_size', default=8, type=int, help='initial image size')
-    parser.add_argument('--max_size', default=1024, type=int, help='max image size')
+    parser.add_argument('--max_size', default=512, type=int, help='max image size')
     parser.add_argument(
         '--mixing', action='store_true', help='use mixing regularization'
     )
@@ -299,8 +416,9 @@ if __name__ == '__main__':
     transform = transforms.Compose(
         [
             transforms.RandomHorizontalFlip(),
+            transforms.RandomVerticalFlip(),
             transforms.ToTensor(),
-            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+            #transforms.Normalize((0.5,), (0.5)),
         ]
     )
 
@@ -317,5 +435,8 @@ if __name__ == '__main__':
     args.gen_sample = {512: (8, 4), 1024: (4, 2)}
 
     args.batch_default = 32
+
+    init_freeze(generator)
+    init_freeze(discriminator)
 
     train(args, dataset, generator, discriminator)

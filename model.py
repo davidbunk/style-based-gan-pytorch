@@ -375,7 +375,7 @@ class Generator(nn.Module):
     def __init__(self, code_dim, fused=True):
         super().__init__()
 
-        self.progression = nn.ModuleList(
+        self.progression_match = nn.ModuleList(
             [
                 StyledConvBlock(512, 512, 3, 1, initial=True),  # 4
                 StyledConvBlock(512, 512, 3, 1, upsample=True),  # 8
@@ -389,17 +389,17 @@ class Generator(nn.Module):
             ]
         )
 
-        self.to_rgb = nn.ModuleList(
+        self.to_rgb_match = nn.ModuleList(
             [
-                EqualConv2d(512, 3, 1),
-                EqualConv2d(512, 3, 1),
-                EqualConv2d(512, 3, 1),
-                EqualConv2d(512, 3, 1),
-                EqualConv2d(256, 3, 1),
-                EqualConv2d(128, 3, 1),
-                EqualConv2d(64, 3, 1),
-                EqualConv2d(32, 3, 1),
-                EqualConv2d(16, 3, 1),
+                EqualConv2d(512, 1, 1),
+                EqualConv2d(512, 1, 1),
+                EqualConv2d(512, 1, 1),
+                EqualConv2d(512, 1, 1),
+                EqualConv2d(256, 1, 1),
+                EqualConv2d(128, 1, 1),
+                EqualConv2d(64, 1, 1),
+                EqualConv2d(32, 1, 1),
+                EqualConv2d(16, 1, 1),
             ]
         )
 
@@ -409,14 +409,14 @@ class Generator(nn.Module):
         out = noise[0]
 
         if len(style) < 2:
-            inject_index = [len(self.progression) + 1]
+            inject_index = [len(self.progression_match) + 1]
 
         else:
             inject_index = random.sample(list(range(step)), len(style) - 1)
 
         crossover = 0
 
-        for i, (conv, to_rgb) in enumerate(zip(self.progression, self.to_rgb)):
+        for i, (conv, to_rgb_match) in enumerate(zip(self.progression_match, self.to_rgb_match)):
             if mixing_range == (-1, -1):
                 if crossover < len(inject_index) and i > inject_index[crossover]:
                     crossover = min(crossover + 1, len(style))
@@ -429,20 +429,25 @@ class Generator(nn.Module):
 
                 else:
                     style_step = style[0]
-
+ 
             if i > 0 and step > 0:
                 out_prev = out
-
+                #out = torch.cat((out, imgstack), 1)
                 out = conv(out, style_step, noise[i])
-
             else:
                 out = conv(out, style_step, noise[i])
 
             if i == step:
-                out = to_rgb(out)
+                out = to_rgb_match(out)
+
+                # if i == 0:
+                #     imgstack = out
+                # else:
+                #     imgstack = torch.cat([imgstack, out], 1)
+
 
                 if i > 0 and 0 <= alpha < 1:
-                    skip_rgb = self.to_rgb[i - 1](out_prev)
+                    skip_rgb = self.to_rgb_match[i - 1](out_prev)
                     skip_rgb = F.interpolate(skip_rgb, scale_factor=2, mode='nearest')
                     out = (1 - alpha) * skip_rgb + alpha * out
 
@@ -510,7 +515,7 @@ class Discriminator(nn.Module):
     def __init__(self, fused=True):
         super().__init__()
 
-        self.progression = nn.ModuleList(
+        self.progression_match = nn.ModuleList(
             [
                 ConvBlock(16, 32, 3, 1, downsample=True, fused=fused),  # 512
                 ConvBlock(32, 64, 3, 1, downsample=True, fused=fused),  # 256
@@ -524,23 +529,23 @@ class Discriminator(nn.Module):
             ]
         )
 
-        self.from_rgb = nn.ModuleList(
+        self.from_rgb_match = nn.ModuleList(
             [
-                EqualConv2d(3, 16, 1),
-                EqualConv2d(3, 32, 1),
-                EqualConv2d(3, 64, 1),
-                EqualConv2d(3, 128, 1),
-                EqualConv2d(3, 256, 1),
-                EqualConv2d(3, 512, 1),
-                EqualConv2d(3, 512, 1),
-                EqualConv2d(3, 512, 1),
-                EqualConv2d(3, 512, 1),
+                EqualConv2d(1, 16, 1),
+                EqualConv2d(1, 32, 1),
+                EqualConv2d(1, 64, 1),
+                EqualConv2d(1, 128, 1),
+                EqualConv2d(1, 256, 1),
+                EqualConv2d(1, 512, 1),
+                EqualConv2d(1, 512, 1),
+                EqualConv2d(1, 512, 1),
+                EqualConv2d(1, 512, 1),
             ]
         )
 
         # self.blur = Blur()
 
-        self.n_layer = len(self.progression)
+        self.n_layer = len(self.progression_match)
 
         self.linear = EqualLinear(512, 1)
 
@@ -549,7 +554,7 @@ class Discriminator(nn.Module):
             index = self.n_layer - i - 1
 
             if i == step:
-                out = self.from_rgb[index](input)
+                out = self.from_rgb_match[index](input)
 
             if i == 0:
                 out_std = torch.sqrt(out.var(0, unbiased=False) + 1e-8)
@@ -557,12 +562,12 @@ class Discriminator(nn.Module):
                 mean_std = mean_std.expand(out.size(0), 1, 4, 4)
                 out = torch.cat([out, mean_std], 1)
 
-            out = self.progression[index](out)
+            out = self.progression_match[index](out)
 
             if i > 0:
                 if i == step and 0 <= alpha < 1:
                     skip_rgb = F.avg_pool2d(input, 2)
-                    skip_rgb = self.from_rgb[index + 1](skip_rgb)
+                    skip_rgb = self.from_rgb_match[index + 1](skip_rgb)
 
                     out = (1 - alpha) * skip_rgb + alpha * out
 

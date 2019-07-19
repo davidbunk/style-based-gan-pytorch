@@ -19,14 +19,19 @@ class MultiResolutionDataset(Dataset):
         if not self.env:
             raise IOError('Cannot open lmdb dataset', path)
 
+        self.length = {}
         with self.env.begin(write=False) as txn:
-            self.length = int(txn.get('length'.encode('utf-8')).decode('utf-8'))
+            for res in [4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]:
+                try:
+                    self.length[res] = int(txn.get(f'length-{res}'.encode('utf-8')).decode('utf-8'))
+                except:
+                    pass
 
         self.resolution = resolution
         self.transform = transform
 
     def __len__(self):
-        return self.length
+        return self.length[self.resolution]
 
     def __getitem__(self, index):
         with self.env.begin(write=False) as txn:
